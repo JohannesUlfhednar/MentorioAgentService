@@ -1,189 +1,221 @@
-"""FastAPI server for the Coach Majen Agent Service.
+"""Coach Majen Agent Service — FastAPI server.
 
-This replaces the Node.js mentorAIService.ts with a proper multi-agent
-system built on the OpenAI Agents SDK.
-
-The Node.js backend calls POST /chat with user/mentor IDs and the message,
-and this service runs the full agent pipeline and returns the response.
+V2 Architecture:
+- Coach Majen is the master agent (GPT-4o) with consistent persona
+- Sub-agents (GPT-4o-mini) are exposed as tools, not handoffs
+- Input guardrail: blocks unsafe requests (medical, self-harm, steroids)
+- Output guardrail: ensures Norwegian language
+- Dynamic instructions: user data injected at runtime
+- Tracing: enabled via OPENAI_AGENTS_TRACING_ENABLED env var
 """
 
 from __future__ import annotations
 
-import os
 import logging
+import os
+import time
+import traceback
 from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
-load_dotenv()
-
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from agents import Runner
+from agents import Runner, InputGuardrailTripwireTriggered
 
-from agents_pkg.coach_majen import (
-    build_coach_majen,
-    load_context,
-    CoachContext,
-    COACH_MAJEN_INSTRUCTIONS,
+load_dotenv()
+
+# ── Logging ─────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+    datefmt="%H:%M:%S",
 )
-from agents_pkg.db import find_one, find_many, USERS, COACH_KNOWLEDGE
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("agent-service")
+logger = logging.getLogger("agent.server")
 
 
-# ── App lifecycle ───────────────────────────────────────────────────
+# ── Tracing (optional, if key is set) ──────────────────────────────
+if os.getenv("OPENAI_API_KEY"):
+    os.environ.setdefault("OPENAI_AGENTS_TRACING_ENABLED", "true")
+
+
+# ── FastAPI app ─────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("Agent service starting...")
+    logger.info("=== Coach Majen Agent Service V2 starting ===")
+    logger.info(f"Tracing: {os.getenv('OPENAI_AGENTS_TRACING_ENABLED', 'false')}")
     yield
-    logger.info("Agent service shutting down...")
+    logger.info("=== Coach Majen Agent Service V2 shutting down ===")
 
 
 app = FastAPI(
-    title="MentorOS Agent Service",
-    description="Multi-agent coaching system powered by OpenAI Agents SDK",
-    version="1.0.0",
+    title="Coach Majen Agent Service",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-# ── Request / Response models ───────────────────────────────────────
+
+# ── Request / Response models ──────────────────────────────────────
 
 class ChatRequest(BaseModel):
     user_id: str
     mentor_id: str
     message: str
-    conversation_history: list[dict] | None = None  # [{role, content}]
+    conversation_history: list[dict] = []
 
 
 class ChatResponse(BaseModel):
     response: str
-    agent_name: str
-    tools_called: list[str]
+    agent_name: str = "Coach Majen"
+    tools_called: list[str] = []
+    processing_ms: int = 0
+    guardrail_blocked: bool = False
+    blocked_reason: str = ""
 
 
-# ── Agent cache (build once per mentor) ─────────────────────────────
+# ── Agent singleton ────────────────────────────────────────────────
+_agent = None
 
-_agent_cache: dict[str, any] = {}
-
-
-async def get_or_build_agent(mentor_id: str):
-    if mentor_id in _agent_cache:
-        return _agent_cache[mentor_id]
-
-    # Load mentor profile from DB
-    mentor = find_one(USERS, {"id": mentor_id})
-    mentor_name = "Coach Majen"
-    extra_instructions = ""
-    voice_tone = ""
-    training_philosophy = ""
-    nutrition_philosophy = ""
-
-    if mentor:
-        first = mentor.get("first_name", "")
-        last = mentor.get("last_name", "")
-        if first or last:
-            mentor_name = f"Coach {first} {last}".strip()
-        voice_tone = mentor.get("mentor_ai_voice_tone", "") or ""
-        training_philosophy = mentor.get("mentor_ai_training_philosophy", "") or ""
-        nutrition_philosophy = mentor.get("mentor_ai_nutrition_philosophy", "") or ""
-        core = mentor.get("core_instructions", "") or ""
-        if core:
-            extra_instructions = core
-
-    agent = build_coach_majen(
-        mentor_name=mentor_name,
-        extra_instructions=extra_instructions,
-        voice_tone=voice_tone,
-        training_philosophy=training_philosophy,
-        nutrition_philosophy=nutrition_philosophy,
-    )
-    _agent_cache[mentor_id] = agent
-    return agent
+def _get_agent():
+    """Lazy-init the Coach Majen agent (singleton)."""
+    global _agent
+    if _agent is None:
+        from agents_pkg.coach_majen import build_coach_majen
+        _agent = build_coach_majen()
+        logger.info("Coach Majen agent built")
+    return _agent
 
 
-# ── Main chat endpoint ──────────────────────────────────────────────
+# ── Chat endpoint ──────────────────────────────────────────────────
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
+    """Main chat endpoint. Processes user message through Coach Majen."""
+    start = time.time()
+    logger.info(f"[chat] user={req.user_id} mentor={req.mentor_id} msg={req.message[:80]}...")
+
     try:
-        logger.info(f"Chat request: user={req.user_id}, mentor={req.mentor_id}, msg='{req.message[:80]}...'")
+        # Build context with preloaded user data
+        from agents_pkg.coach_majen import load_context
+        ctx = load_context(req.user_id, req.mentor_id)
 
-        # Build/cache the agent
-        agent = await get_or_build_agent(req.mentor_id)
+        # Build input messages
+        messages: list[dict] = []
 
-        # Load user context
-        ctx = await load_context(req.user_id, req.mentor_id)
-
-        # Build input with user data context
-        input_parts = []
-
-        # Inject user data into the conversation so the agent knows who they're talking to
-        if ctx.user_name or ctx.onboarding_summary != "Ingen onboarding-data ennå":
-            input_parts.append(
-                f"[SYSTEM: Brukerens navn er '{ctx.user_name}'. "
-                f"Onboarding-data:\n{ctx.onboarding_summary}\n"
-                f"Kontekst:\n{ctx.user_context_summary}]"
-            )
-
-        input_parts.append(req.message)
-        full_input = "\n\n".join(input_parts)
-
-        # Build message list with conversation history
-        messages = []
+        # Add conversation history (last 20 messages)
         if req.conversation_history:
-            for msg in req.conversation_history[-15:]:
+            recent = req.conversation_history[-20:]
+            for msg in recent:
                 role = msg.get("role", "user")
                 content = msg.get("content", "")
-                if content.strip():
+                if role in ("user", "assistant") and content.strip():
                     messages.append({"role": role, "content": content})
 
-        # Add current message
-        messages.append({"role": "user", "content": full_input})
+        # Add user data context as a system-like injection in the first user turn
+        user_data_prefix = ""
+        if ctx.onboarding_summary:
+            user_data_prefix = (
+                f"[SYSTEM: Brukerens profil — {ctx.onboarding_summary.replace(chr(10), ' | ')}] "
+            )
+
+        # Add the current message
+        messages.append({
+            "role": "user",
+            "content": f"{user_data_prefix}{req.message}" if user_data_prefix and not messages else req.message,
+        })
+
+        # If we had history but no user data prefix was added, inject it in the first message
+        if user_data_prefix and messages and len(messages) > 1:
+            first_msg = messages[0]
+            if first_msg["role"] == "user" and "[SYSTEM:" not in first_msg["content"]:
+                messages[0] = {
+                    "role": "user",
+                    "content": f"{user_data_prefix}{first_msg['content']}",
+                }
 
         # Run the agent
-        result = await Runner.run(
-            agent,
-            messages,
-            context=ctx,
-        )
+        agent = _get_agent()
+        result = await Runner.run(agent, messages, context=ctx)
 
-        response_text = result.final_output or ""
-        agent_name = result.last_agent.name if result.last_agent else agent.name
-
-        # Collect tool call names from the run
+        # Collect tool names from the trace
         tools_called = []
         for item in result.new_items:
-            if hasattr(item, "raw_item") and hasattr(item.raw_item, "name"):
-                tools_called.append(item.raw_item.name)
+            item_type = getattr(item, "type", "")
+            if item_type == "tool_call_item":
+                name = getattr(item, "name", None) or getattr(getattr(item, "raw_item", None), "name", "")
+                if name:
+                    tools_called.append(name)
 
-        logger.info(f"Response from {agent_name}: {len(response_text)} chars, tools: {tools_called}")
+        response_text = str(result.final_output or "")
+        elapsed = int((time.time() - start) * 1000)
+
+        logger.info(
+            f"[chat] done user={req.user_id} tools={tools_called} "
+            f"len={len(response_text)} ms={elapsed}"
+        )
 
         return ChatResponse(
             response=response_text,
-            agent_name=agent_name,
+            agent_name="Coach Majen",
             tools_called=tools_called,
+            processing_ms=elapsed,
+        )
+
+    except InputGuardrailTripwireTriggered as e:
+        elapsed = int((time.time() - start) * 1000)
+        logger.warning(f"[chat] BLOCKED by safety guardrail user={req.user_id}")
+        return ChatResponse(
+            response=(
+                "Beklager, men jeg kan ikke hjelpe med det du spør om. "
+                "Jeg er en fitness-coach og kan hjelpe deg med trening, kosthold og mål. "
+                "Hvis du trenger medisinsk hjelp, ta kontakt med legen din."
+            ),
+            agent_name="Coach Majen",
+            processing_ms=elapsed,
+            guardrail_blocked=True,
+            blocked_reason="safety",
         )
 
     except Exception as e:
-        logger.exception(f"Agent error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        elapsed = int((time.time() - start) * 1000)
+        logger.error(f"[chat] ERROR user={req.user_id}: {e}\n{traceback.format_exc()}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Agent error: {str(e)[:200]}",
+        )
 
 
-# ── Health check ────────────────────────────────────────────────────
+# ── Health endpoint ────────────────────────────────────────────────
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "service": "MentorOS Agent Service"}
+    return {
+        "status": "ok",
+        "version": "2.0.0",
+        "architecture": "agents-as-tools",
+        "features": [
+            "dynamic_instructions",
+            "input_guardrails",
+            "output_guardrails",
+            "agent_delegation",
+            "tracing",
+        ],
+    }
 
 
-# ── Run with uvicorn ────────────────────────────────────────────────
+# ── Run directly ───────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get("PORT", 8100))
-    host = os.environ.get("HOST", "0.0.0.0")
-    uvicorn.run("main:app", host=host, port=port, reload=True)
+    port = int(os.getenv("PORT", "8100"))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
