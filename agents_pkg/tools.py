@@ -26,6 +26,22 @@ from .db import (
 logger = logging.getLogger("agent.tools")
 
 
+def _log_change(user_id: str, event_type: str, summary: str, reason: str = "") -> None:
+    """Log a change event. Silently ignores errors so it never blocks the main operation.
+    event_type must be one of: PLAN_EDIT, NUTRITION_EDIT, WEIGHT_LOG, WORKOUT_LOG, GOAL_EDIT
+    """
+    try:
+        insert_row(CHANGE_EVENTS, {
+            "user_id": user_id,
+            "type": event_type,
+            "summary": summary,
+            "actor": json.dumps({"type": "agent", "name": "Coach Majen"}),
+            "after_data": json.dumps({"reason": reason}) if reason else None,
+        })
+    except Exception as e:
+        logger.warning(f"[_log_change] Could not log change event: {e}")
+
+
 # ═══════════════════════════════════════════════════════════════════
 # WEIGHT & BODY TOOLS
 # ═══════════════════════════════════════════════════════════════════
@@ -45,10 +61,7 @@ async def log_weight(ctx: RunContextWrapper[CoachContext], kg: float, log_date: 
 
     try:
         upsert_row(WEIGHT_ENTRIES, {"user_id": uid, "date": d, "kg": kg}, "user_id,date")
-        insert_row(CHANGE_EVENTS, {
-            "user_id": uid, "type": "WEIGHT_LOG",
-            "summary": f"Vekt logget: {kg} kg ({d})", "actor": "agent",
-        })
+        _log_change(uid, "WEIGHT_LOG", f"Vekt logget: {kg} kg ({d})")
         logger.info(f"[log_weight] user={uid} kg={kg} date={d}")
         return json.dumps({"success": True, "message": f"Vekt logget: {kg} kg ({d}). Synlig i Student Senteret."})
     except Exception as e:
@@ -102,18 +115,22 @@ async def log_meal(
     """
     uid = ctx.context.user_id
     d = log_date or today_str()
-    insert_row(MEAL_LOGS, {
-        "user_id": uid, "date": d, "meal_type": meal_type,
-        "description": description,
-        "total_calories": calories, "total_protein_g": protein_g,
-        "total_carbs_g": carbs_g, "total_fat_g": fat_g,
-        "items": [],
-    })
-    logger.info(f"[log_meal] user={uid} desc={description[:40]} kcal={calories}")
-    return json.dumps({
-        "success": True,
-        "message": f"Måltid logget: {description} ({calories} kcal, {protein_g}g P, {carbs_g}g K, {fat_g}g F). Synlig i Ernæring-fanen.",
-    })
+    try:
+        insert_row(MEAL_LOGS, {
+            "user_id": uid, "date": d, "meal_type": meal_type,
+            "description": description,
+            "total_calories": calories, "total_protein_g": protein_g,
+            "total_carbs_g": carbs_g, "total_fat_g": fat_g,
+            "items": [],
+        })
+        logger.info(f"[log_meal] user={uid} desc={description[:40]} kcal={calories}")
+        return json.dumps({
+            "success": True,
+            "message": f"Måltid logget: {description} ({calories} kcal, {protein_g}g P, {carbs_g}g K, {fat_g}g F). Synlig i Ernæring-fanen.",
+        })
+    except Exception as e:
+        logger.error(f"[log_meal] FAILED user={uid}: {e}")
+        return json.dumps({"success": False, "error": f"Kunne ikke logge måltid: {str(e)[:200]}"})
 
 
 @function_tool(timeout=10.0)
@@ -138,8 +155,6 @@ async def save_nutrition_plan(
     protein_grams: int,
     carbs_grams: int,
     fat_grams: int,
-    meals_json: str = "[]",
-    notes: str = "",
     reason: str = "",
 ) -> str:
     """Save a complete nutrition plan to the student center Nutrition tab.
@@ -150,30 +165,18 @@ async def save_nutrition_plan(
         protein_grams: Daily protein target in grams.
         carbs_grams: Daily carbohydrates target in grams.
         fat_grams: Daily fat target in grams.
-        meals_json: JSON string array of meal objects with name, time, items.
-        notes: General nutrition notes for the user.
         reason: Brief reason for plan creation/update.
     """
     uid = ctx.context.user_id
-    try:
-        meals = json.loads(meals_json)
-    except Exception:
-        meals = []
-
     try:
         version = next_version(NUTRITION_PLAN_VERSIONS, uid)
         insert_row(NUTRITION_PLAN_VERSIONS, {
             "user_id": uid, "version": version,
             "kcal": kcal, "protein_grams": protein_grams,
             "carbs_grams": carbs_grams, "fat_grams": fat_grams,
-            "meals": meals, "notes": notes,
-            "created_at": now_iso(),
+            "reason": reason or None,
         })
-        insert_row(CHANGE_EVENTS, {
-            "user_id": uid, "type": "NUTRITION_PLAN_SAVED",
-            "summary": f"Kostholdsplan v{version}: {kcal} kcal, {protein_grams}g P",
-            "actor": "agent", "after": {"version": version, "reason": reason},
-        })
+        _log_change(uid, "NUTRITION_EDIT", f"Kostholdsplan v{version}: {kcal} kcal, {protein_grams}g P", reason)
         logger.info(f"[save_nutrition_plan] user={uid} v{version} {kcal}kcal")
         return json.dumps({
             "success": True,
@@ -208,9 +211,14 @@ async def log_workout(
         entries = json.loads(entries_json)
     except Exception:
         entries = []
-    upsert_row(WORKOUT_LOGS, {"user_id": uid, "date": d, "entries": entries}, "user_id,date")
-    logger.info(f"[log_workout] user={uid} date={d} desc={description[:40]}")
-    return json.dumps({"success": True, "message": f"Trening logget for {d}: {description or 'økt registrert'}. Synlig i Aktivitet-fanen."})
+    try:
+        upsert_row(WORKOUT_LOGS, {"user_id": uid, "date": d, "entries": entries}, "user_id,date")
+        _log_change(uid, "WORKOUT_LOG", f"Trening logget: {description or 'økt'} ({d})")
+        logger.info(f"[log_workout] user={uid} date={d}")
+        return json.dumps({"success": True, "message": f"Trening logget for {d}: {description or 'økt registrert'}. Synlig i Aktivitet-fanen."})
+    except Exception as e:
+        logger.error(f"[log_workout] FAILED user={uid}: {e}")
+        return json.dumps({"success": False, "error": f"Kunne ikke logge trening: {str(e)[:200]}"})
 
 
 @function_tool(timeout=20.0)
@@ -240,13 +248,9 @@ async def save_training_plan(
         version = next_version(TRAINING_PLAN_VERSIONS, uid)
         insert_row(TRAINING_PLAN_VERSIONS, {
             "user_id": uid, "version": version, "days": days,
-            "created_at": now_iso(),
+            "reason": reason or None,
         })
-        insert_row(CHANGE_EVENTS, {
-            "user_id": uid, "type": "TRAINING_PLAN_SAVED",
-            "summary": f"Treningsplan v{version}: {len(days)} dager",
-            "actor": "agent", "after": {"version": version, "reason": reason},
-        })
+        _log_change(uid, "PLAN_EDIT", f"Treningsplan v{version}: {len(days)} dager", reason)
         logger.info(f"[save_training_plan] user={uid} v{version} {len(days)} days")
         return json.dumps({
             "success": True,
@@ -289,29 +293,33 @@ async def save_goal(
         plan_text: Text description of the plan to reach the goal.
     """
     uid = ctx.context.user_id
-    get_db().table(GOALS).update({"is_current": False}).eq("user_id", uid).execute()
-    version = next_version(GOALS, uid)
+    try:
+        get_db().table(GOALS).update({"is_current": False}).eq("user_id", uid).execute()
+        version = next_version(GOALS, uid)
 
-    insert_row(GOALS, {
-        "user_id": uid, "version": version, "is_current": True,
-        "target_weight_kg": target_weight_kg,
-        "strength_targets": strength_targets,
-        "horizon_weeks": horizon_weeks,
-        "plan": {"text": plan_text} if plan_text else None,
-        "created_at": now_iso(),
-    })
-    parts = []
-    if target_weight_kg:
-        parts.append(f"vektmål {target_weight_kg} kg")
-    if strength_targets:
-        parts.append(f"styrke: {strength_targets}")
-    if horizon_weeks:
-        parts.append(f"{horizon_weeks} uker")
-    logger.info(f"[save_goal] user={uid} v{version} {parts}")
-    return json.dumps({
-        "success": True,
-        "message": f"Mål lagret: {', '.join(parts) or 'oppdatert'}. Synlig på Dashboard i Student Senteret.",
-    })
+        insert_row(GOALS, {
+            "user_id": uid, "version": version, "is_current": True,
+            "target_weight_kg": target_weight_kg,
+            "strength_targets": strength_targets,
+            "horizon_weeks": horizon_weeks,
+            "plan": {"text": plan_text} if plan_text else None,
+        })
+        parts = []
+        if target_weight_kg:
+            parts.append(f"vektmål {target_weight_kg} kg")
+        if strength_targets:
+            parts.append(f"styrke: {strength_targets}")
+        if horizon_weeks:
+            parts.append(f"{horizon_weeks} uker")
+        _log_change(uid, "GOAL_EDIT", f"Mål v{version}: {', '.join(parts) or 'oppdatert'}")
+        logger.info(f"[save_goal] user={uid} v{version} {parts}")
+        return json.dumps({
+            "success": True,
+            "message": f"Mål lagret: {', '.join(parts) or 'oppdatert'}. Synlig på Dashboard i Student Senteret.",
+        })
+    except Exception as e:
+        logger.error(f"[save_goal] FAILED user={uid}: {e}")
+        return json.dumps({"success": False, "error": f"Kunne ikke lagre mål: {str(e)[:200]}"})
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -327,12 +335,16 @@ async def remember_fact(ctx: RunContextWrapper[CoachContext], key: str, value: s
         value: The fact to remember.
     """
     uid = ctx.context.user_id
-    upsert_row(USER_CONTEXT, {
-        "user_id": uid, "key": key, "value": value,
-        "source": "agent", "updated_at": now_iso(),
-    }, "user_id,key")
-    logger.info(f"[remember_fact] user={uid} {key}={value[:50]}")
-    return json.dumps({"success": True, "message": f"Lagret: {key} = {value}"})
+    try:
+        upsert_row(USER_CONTEXT, {
+            "user_id": uid, "key": key, "value": value,
+            "source": "agent", "updated_at": now_iso(),
+        }, "user_id,key")
+        logger.info(f"[remember_fact] user={uid} {key}={value[:50]}")
+        return json.dumps({"success": True, "message": f"Lagret: {key} = {value}"})
+    except Exception as e:
+        logger.error(f"[remember_fact] FAILED user={uid}: {e}")
+        return json.dumps({"success": False, "error": f"Kunne ikke lagre fakta: {str(e)[:200]}"})
 
 
 @function_tool(timeout=10.0)
@@ -365,9 +377,13 @@ async def update_profile(
         row["injury_history"] = injury_history
     if nutrition_preferences is not None:
         row["nutrition_preferences"] = nutrition_preferences
-    upsert_row(USER_PROFILES, row, "user_id")
-    logger.info(f"[update_profile] user={uid} fields={list(row.keys())}")
-    return json.dumps({"success": True, "message": "Profil oppdatert i Student Senteret."})
+    try:
+        upsert_row(USER_PROFILES, row, "user_id")
+        logger.info(f"[update_profile] user={uid} fields={list(row.keys())}")
+        return json.dumps({"success": True, "message": "Profil oppdatert i Student Senteret."})
+    except Exception as e:
+        logger.error(f"[update_profile] FAILED user={uid}: {e}")
+        return json.dumps({"success": False, "error": f"Kunne ikke oppdatere profil: {str(e)[:200]}"})
 
 
 @function_tool(timeout=10.0)
@@ -377,46 +393,67 @@ async def get_user_stats(ctx: RunContextWrapper[CoachContext]) -> str:
     uid = ctx.context.user_id
     stats: dict = {}
 
-    rows = get_db().table(WEIGHT_ENTRIES).select("date, kg") \
-        .eq("user_id", uid).order("date", desc=True).limit(5).execute().data or []
-    if rows:
-        stats["latest_weight"] = rows[0]
-        stats["recent_weights"] = rows
+    try:
+        rows = get_db().table(WEIGHT_ENTRIES).select("date, kg") \
+            .eq("user_id", uid).order("date", desc=True).limit(5).execute().data or []
+        if rows:
+            stats["latest_weight"] = rows[0]
+            stats["recent_weights"] = rows
+    except Exception:
+        pass
 
-    goal = find_one(GOALS, {"user_id": uid, "is_current": True})
-    if goal:
-        stats["current_goal"] = {
-            k: goal.get(k) for k in ("target_weight_kg", "strength_targets", "horizon_weeks") if goal.get(k)
-        }
+    try:
+        goal = find_one(GOALS, {"user_id": uid, "is_current": True})
+        if goal:
+            stats["current_goal"] = {
+                k: goal.get(k) for k in ("target_weight_kg", "strength_targets", "horizon_weeks") if goal.get(k)
+            }
+    except Exception:
+        pass
 
-    meals = find_many(MEAL_LOGS, {"user_id": uid, "date": today_str()})
-    totals = {"calories": 0, "protein": 0, "carbs": 0, "fat": 0}
-    for m in meals:
-        totals["calories"] += m.get("total_calories", 0) or 0
-        totals["protein"] += m.get("total_protein_g", 0) or 0
-        totals["carbs"] += m.get("total_carbs_g", 0) or 0
-        totals["fat"] += m.get("total_fat_g", 0) or 0
-    stats["today_meals"] = {"count": len(meals), "totals": totals}
+    try:
+        meals = find_many(MEAL_LOGS, {"user_id": uid, "date": today_str()})
+        totals = {"calories": 0, "protein": 0, "carbs": 0, "fat": 0}
+        for m in meals:
+            totals["calories"] += m.get("total_calories", 0) or 0
+            totals["protein"] += m.get("total_protein_g", 0) or 0
+            totals["carbs"] += m.get("total_carbs_g", 0) or 0
+            totals["fat"] += m.get("total_fat_g", 0) or 0
+        stats["today_meals"] = {"count": len(meals), "totals": totals}
+    except Exception:
+        pass
 
-    tp = get_db().table(TRAINING_PLAN_VERSIONS).select("version, days") \
-        .eq("user_id", uid).order("version", desc=True).limit(1).maybe_single().execute()
-    if tp.data:
-        stats["training_plan"] = {"version": tp.data.get("version"), "days_count": len(tp.data.get("days", []))}
+    try:
+        tp = get_db().table(TRAINING_PLAN_VERSIONS).select("version, days") \
+            .eq("user_id", uid).order("version", desc=True).limit(1).maybe_single().execute()
+        if tp.data:
+            stats["training_plan"] = {"version": tp.data.get("version"), "days_count": len(tp.data.get("days", []))}
+    except Exception:
+        pass
 
-    np_res = get_db().table(NUTRITION_PLAN_VERSIONS).select("version, kcal, protein_grams, carbs_grams, fat_grams") \
-        .eq("user_id", uid).order("version", desc=True).limit(1).maybe_single().execute()
-    if np_res.data:
-        stats["nutrition_plan"] = np_res.data
+    try:
+        np_res = get_db().table(NUTRITION_PLAN_VERSIONS).select("version, kcal, protein_grams, carbs_grams, fat_grams") \
+            .eq("user_id", uid).order("version", desc=True).limit(1).maybe_single().execute()
+        if np_res.data:
+            stats["nutrition_plan"] = np_res.data
+    except Exception:
+        pass
 
-    ctx_rows = find_many(USER_CONTEXT, {"user_id": uid}, select="key, value")
-    if ctx_rows:
-        stats["user_context"] = {r["key"]: r["value"] for r in ctx_rows}
+    try:
+        ctx_rows = find_many(USER_CONTEXT, {"user_id": uid}, select="key, value")
+        if ctx_rows:
+            stats["user_context"] = {r["key"]: r["value"] for r in ctx_rows}
+    except Exception:
+        pass
 
-    profile = find_one(USER_PROFILES, {"user_id": uid})
-    if profile:
-        stats["profile"] = {
-            k: v for k, v in profile.items()
-            if k not in ("id", "created_at", "updated_at") and v is not None
-        }
+    try:
+        profile = find_one(USER_PROFILES, {"user_id": uid})
+        if profile:
+            stats["profile"] = {
+                k: v for k, v in profile.items()
+                if k not in ("id", "created_at", "updated_at") and v is not None
+            }
+    except Exception:
+        pass
 
     return json.dumps(stats, default=str)
