@@ -49,7 +49,7 @@ def insert_row(table: str, row: dict[str, Any]) -> dict | None:
         return resp.data[0] if resp.data else None
     except Exception as e:
         logger.error(f"insert_row({table}) failed: {e}")
-        return None
+        raise  # Re-raise so tools can report the actual error
 
 
 def find_one(table: str, filters: dict[str, Any], select: str = "*") -> dict | None:

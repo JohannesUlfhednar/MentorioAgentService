@@ -43,13 +43,17 @@ async def log_weight(ctx: RunContextWrapper[CoachContext], kg: float, log_date: 
     if kg < 20 or kg > 500:
         return json.dumps({"success": False, "error": "Vekt må være mellom 20 og 500 kg"})
 
-    upsert_row(WEIGHT_ENTRIES, {"user_id": uid, "date": d, "kg": kg}, "user_id,date")
-    insert_row(CHANGE_EVENTS, {
-        "user_id": uid, "type": "WEIGHT_LOG",
-        "summary": f"Vekt logget: {kg} kg ({d})", "actor": "agent",
-    })
-    logger.info(f"[log_weight] user={uid} kg={kg} date={d}")
-    return json.dumps({"success": True, "message": f"Vekt logget: {kg} kg ({d}). Synlig i Student Senteret."})
+    try:
+        upsert_row(WEIGHT_ENTRIES, {"user_id": uid, "date": d, "kg": kg}, "user_id,date")
+        insert_row(CHANGE_EVENTS, {
+            "user_id": uid, "type": "WEIGHT_LOG",
+            "summary": f"Vekt logget: {kg} kg ({d})", "actor": "agent",
+        })
+        logger.info(f"[log_weight] user={uid} kg={kg} date={d}")
+        return json.dumps({"success": True, "message": f"Vekt logget: {kg} kg ({d}). Synlig i Student Senteret."})
+    except Exception as e:
+        logger.error(f"[log_weight] FAILED user={uid}: {e}")
+        return json.dumps({"success": False, "error": f"Kunne ikke logge vekt: {str(e)[:200]}"})
 
 
 @function_tool(timeout=10.0)
@@ -156,24 +160,28 @@ async def save_nutrition_plan(
     except Exception:
         meals = []
 
-    version = next_version(NUTRITION_PLAN_VERSIONS, uid)
-    insert_row(NUTRITION_PLAN_VERSIONS, {
-        "user_id": uid, "version": version,
-        "kcal": kcal, "protein_grams": protein_grams,
-        "carbs_grams": carbs_grams, "fat_grams": fat_grams,
-        "meals": meals, "notes": notes,
-        "created_at": now_iso(),
-    })
-    insert_row(CHANGE_EVENTS, {
-        "user_id": uid, "type": "NUTRITION_PLAN_SAVED",
-        "summary": f"Kostholdsplan v{version}: {kcal} kcal, {protein_grams}g P",
-        "actor": "agent", "after": {"version": version, "reason": reason},
-    })
-    logger.info(f"[save_nutrition_plan] user={uid} v{version} {kcal}kcal")
-    return json.dumps({
-        "success": True,
-        "message": f"Kostholdsplan lagret (v{version}): {kcal} kcal, {protein_grams}g protein, {carbs_grams}g karbs, {fat_grams}g fett. Brukeren finner den i Ernæring-fanen i Student Senteret.",
-    })
+    try:
+        version = next_version(NUTRITION_PLAN_VERSIONS, uid)
+        insert_row(NUTRITION_PLAN_VERSIONS, {
+            "user_id": uid, "version": version,
+            "kcal": kcal, "protein_grams": protein_grams,
+            "carbs_grams": carbs_grams, "fat_grams": fat_grams,
+            "meals": meals, "notes": notes,
+            "created_at": now_iso(),
+        })
+        insert_row(CHANGE_EVENTS, {
+            "user_id": uid, "type": "NUTRITION_PLAN_SAVED",
+            "summary": f"Kostholdsplan v{version}: {kcal} kcal, {protein_grams}g P",
+            "actor": "agent", "after": {"version": version, "reason": reason},
+        })
+        logger.info(f"[save_nutrition_plan] user={uid} v{version} {kcal}kcal")
+        return json.dumps({
+            "success": True,
+            "message": f"Kostholdsplan lagret (v{version}): {kcal} kcal, {protein_grams}g protein, {carbs_grams}g karbs, {fat_grams}g fett. Brukeren finner den i Ernæring-fanen i Student Senteret.",
+        })
+    except Exception as e:
+        logger.error(f"[save_nutrition_plan] FAILED user={uid}: {e}")
+        return json.dumps({"success": False, "error": f"Kunne ikke lagre kostholdsplanen: {str(e)[:200]}"})
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -228,21 +236,25 @@ async def save_training_plan(
     if not days or not isinstance(days, list):
         return json.dumps({"success": False, "error": "days_json må inneholde minst 1 treningsdag"})
 
-    version = next_version(TRAINING_PLAN_VERSIONS, uid)
-    insert_row(TRAINING_PLAN_VERSIONS, {
-        "user_id": uid, "version": version, "days": days,
-        "created_at": now_iso(),
-    })
-    insert_row(CHANGE_EVENTS, {
-        "user_id": uid, "type": "TRAINING_PLAN_SAVED",
-        "summary": f"Treningsplan v{version}: {len(days)} dager",
-        "actor": "agent", "after": {"version": version, "reason": reason},
-    })
-    logger.info(f"[save_training_plan] user={uid} v{version} {len(days)} days")
-    return json.dumps({
-        "success": True,
-        "message": f"Treningsplan lagret (v{version}) med {len(days)} treningsdager. Brukeren finner den i Aktivitet-fanen i Student Senteret.",
-    })
+    try:
+        version = next_version(TRAINING_PLAN_VERSIONS, uid)
+        insert_row(TRAINING_PLAN_VERSIONS, {
+            "user_id": uid, "version": version, "days": days,
+            "created_at": now_iso(),
+        })
+        insert_row(CHANGE_EVENTS, {
+            "user_id": uid, "type": "TRAINING_PLAN_SAVED",
+            "summary": f"Treningsplan v{version}: {len(days)} dager",
+            "actor": "agent", "after": {"version": version, "reason": reason},
+        })
+        logger.info(f"[save_training_plan] user={uid} v{version} {len(days)} days")
+        return json.dumps({
+            "success": True,
+            "message": f"Treningsplan lagret (v{version}) med {len(days)} treningsdager. Brukeren finner den i Aktivitet-fanen i Student Senteret.",
+        })
+    except Exception as e:
+        logger.error(f"[save_training_plan] FAILED user={uid}: {e}")
+        return json.dumps({"success": False, "error": f"Kunne ikke lagre treningsplanen: {str(e)[:200]}"})
 
 
 @function_tool(timeout=10.0)
