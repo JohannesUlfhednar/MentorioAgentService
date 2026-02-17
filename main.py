@@ -195,13 +195,60 @@ async def chat(req: ChatRequest):
         )
 
 
+# ── Debug endpoint — check if plans exist in DB ──────────────────
+
+@app.get("/debug/plans/{user_id}")
+async def debug_plans(user_id: str):
+    """Check what training plans exist for a user. For debugging only."""
+    from agents_pkg.db import get_db, TRAINING_PLAN_VERSIONS, NUTRITION_PLAN_VERSIONS
+    try:
+        tp = get_db().table(TRAINING_PLAN_VERSIONS) \
+            .select("id, user_id, version, days, reason, created_at") \
+            .eq("user_id", user_id) \
+            .order("version", desc=True) \
+            .limit(3) \
+            .execute()
+
+        np = get_db().table(NUTRITION_PLAN_VERSIONS) \
+            .select("id, user_id, version, kcal, protein_grams, reason, created_at") \
+            .eq("user_id", user_id) \
+            .order("version", desc=True) \
+            .limit(3) \
+            .execute()
+
+        return {
+            "user_id": user_id,
+            "training_plans": tp.data or [],
+            "training_plan_count": len(tp.data or []),
+            "nutrition_plans": np.data or [],
+            "nutrition_plan_count": len(np.data or []),
+        }
+    except Exception as e:
+        return {"error": str(e), "user_id": user_id}
+
+
+@app.get("/debug/recent-plans")
+async def debug_recent_plans():
+    """Check the most recent training plans across all users. For debugging."""
+    from agents_pkg.db import get_db, TRAINING_PLAN_VERSIONS
+    try:
+        tp = get_db().table(TRAINING_PLAN_VERSIONS) \
+            .select("id, user_id, version, reason, created_at") \
+            .order("created_at", desc=True) \
+            .limit(10) \
+            .execute()
+        return {"recent_plans": tp.data or [], "count": len(tp.data or [])}
+    except Exception as e:
+        return {"error": str(e)}
+
+
 # ── Health endpoint ────────────────────────────────────────────────
 
 @app.get("/health")
 async def health():
     return {
         "status": "ok",
-        "version": "2.0.0",
+        "version": "2.1.0",
         "architecture": "agents-as-tools",
         "features": [
             "dynamic_instructions",
@@ -209,6 +256,7 @@ async def health():
             "output_guardrails",
             "agent_delegation",
             "tracing",
+            "debug_endpoints",
         ],
     }
 

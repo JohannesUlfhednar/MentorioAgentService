@@ -138,7 +138,23 @@ async def delegate_training_plan(ctx: RunContextWrapper[CoachContext], task: str
         task: Complete plan to save including all days and exercises in detail.
               Example: 'Lagre treningsplan med 5 dager: Mandag=Bryst(Benkpress 4x6-8, Skrå hantelpress 3x8-10), ...'
     """
+    logger.info(f"[delegate_training_plan] user={ctx.context.user_id} task_len={len(task)}")
     result = await Runner.run(_training_planner, task, context=ctx.context)
+
+    # Log what sub-agent tools were called
+    sub_tools = []
+    for item in result.new_items:
+        item_type = getattr(item, "type", "")
+        if item_type == "tool_call_item":
+            name = getattr(item, "name", None) or getattr(getattr(item, "raw_item", None), "name", "")
+            if name:
+                sub_tools.append(name)
+        elif item_type == "tool_call_output_item":
+            output = getattr(item, "output", "")
+            if output:
+                logger.info(f"[delegate_training_plan] tool_output: {str(output)[:300]}")
+
+    logger.info(f"[delegate_training_plan] sub_tools_called={sub_tools} final_output_len={len(str(result.final_output))}")
     return str(result.final_output)
 
 

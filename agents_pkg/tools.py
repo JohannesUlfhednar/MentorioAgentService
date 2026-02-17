@@ -236,28 +236,40 @@ async def save_training_plan(
         reason: Brief reason for plan creation/update.
     """
     uid = ctx.context.user_id
+    logger.info(f"[save_training_plan] CALLED user={uid} days_json_len={len(days_json)} reason={reason[:50] if reason else 'none'}")
+    logger.info(f"[save_training_plan] days_json_preview: {days_json[:500]}")
+
     try:
         days = json.loads(days_json)
     except Exception as e:
+        logger.error(f"[save_training_plan] JSON parse failed user={uid}: {e}")
         return json.dumps({"success": False, "error": f"Ugyldig JSON: {e}"})
 
     if not days or not isinstance(days, list):
+        logger.error(f"[save_training_plan] days is empty or not list user={uid} type={type(days)}")
         return json.dumps({"success": False, "error": "days_json må inneholde minst 1 treningsdag"})
+
+    logger.info(f"[save_training_plan] Parsed {len(days)} days, first day keys: {list(days[0].keys()) if days else 'N/A'}")
 
     try:
         version = next_version(TRAINING_PLAN_VERSIONS, uid)
-        insert_row(TRAINING_PLAN_VERSIONS, {
+        row_data = {
             "user_id": uid, "version": version, "days": days,
             "reason": reason or None,
-        })
+        }
+        logger.info(f"[save_training_plan] Inserting v{version} with {len(days)} days for user={uid}")
+        result = insert_row(TRAINING_PLAN_VERSIONS, row_data)
+        logger.info(f"[save_training_plan] INSERT SUCCESS user={uid} v{version} result_id={result.get('id') if result else 'none'}")
+
         _log_change(uid, "PLAN_EDIT", f"Treningsplan v{version}: {len(days)} dager", reason)
-        logger.info(f"[save_training_plan] user={uid} v{version} {len(days)} days")
         return json.dumps({
             "success": True,
             "message": f"Treningsplan lagret (v{version}) med {len(days)} treningsdager. Brukeren finner den i Aktivitet-fanen i Student Senteret.",
         })
     except Exception as e:
         logger.error(f"[save_training_plan] FAILED user={uid}: {e}")
+        import traceback
+        logger.error(f"[save_training_plan] traceback: {traceback.format_exc()}")
         return json.dumps({"success": False, "error": f"Kunne ikke lagre treningsplanen: {str(e)[:200]}"})
 
 
