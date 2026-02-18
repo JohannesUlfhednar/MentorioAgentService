@@ -121,7 +121,7 @@ async def log_meal(
             "description": description,
             "total_calories": calories, "total_protein_g": protein_g,
             "total_carbs_g": carbs_g, "total_fat_g": fat_g,
-            "items": [],
+            "items": [], "source": "agent",
         })
         logger.info(f"[log_meal] user={uid} desc={description[:40]} kcal={calories}")
         return json.dumps({
@@ -148,7 +148,7 @@ async def get_today_nutrition(ctx: RunContextWrapper[CoachContext]) -> str:
     return json.dumps({"meals": summaries, "totals": totals, "count": len(meals)})
 
 
-@function_tool(timeout=20.0)
+@function_tool(timeout=30.0)
 async def save_nutrition_plan(
     ctx: RunContextWrapper[CoachContext],
     kcal: int,
@@ -221,7 +221,7 @@ async def log_workout(
         return json.dumps({"success": False, "error": f"Kunne ikke logge trening: {str(e)[:200]}"})
 
 
-@function_tool(timeout=20.0)
+@function_tool(timeout=45.0)
 async def save_training_plan(
     ctx: RunContextWrapper[CoachContext],
     days_json: str,

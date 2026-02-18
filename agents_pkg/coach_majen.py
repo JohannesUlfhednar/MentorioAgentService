@@ -130,7 +130,7 @@ async def delegate_nutrition(ctx: RunContextWrapper[CoachContext], task: str) ->
     return str(result.final_output)
 
 
-@function_tool(timeout=45.0)
+@function_tool(timeout=90.0)
 async def delegate_training_plan(ctx: RunContextWrapper[CoachContext], task: str) -> str:
     """Save or retrieve a training plan. Include ALL plan details in the task.
 

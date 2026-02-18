@@ -22,7 +22,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from agents import Runner, InputGuardrailTripwireTriggered
+from agents import Runner, InputGuardrailTripwireTriggered, OutputGuardrailTripwireTriggered
 
 load_dotenv()
 
@@ -128,20 +128,20 @@ async def chat(req: ChatRequest):
                 f"[SYSTEM: Brukerens profil — {ctx.onboarding_summary.replace(chr(10), ' | ')}] "
             )
 
-        # Add the current message
-        messages.append({
-            "role": "user",
-            "content": f"{user_data_prefix}{req.message}" if user_data_prefix and not messages else req.message,
-        })
-
-        # If we had history but no user data prefix was added, inject it in the first message
-        if user_data_prefix and messages and len(messages) > 1:
-            first_msg = messages[0]
-            if first_msg["role"] == "user" and "[SYSTEM:" not in first_msg["content"]:
-                messages[0] = {
-                    "role": "user",
-                    "content": f"{user_data_prefix}{first_msg['content']}",
-                }
+        # Inject user data prefix into the first user message in history, or into the new message
+        if user_data_prefix:
+            injected = False
+            for i, msg in enumerate(messages):
+                if msg["role"] == "user" and "[SYSTEM:" not in msg["content"]:
+                    messages[i] = {"role": "user", "content": f"{user_data_prefix}{msg['content']}"}
+                    injected = True
+                    break
+            messages.append({
+                "role": "user",
+                "content": f"{user_data_prefix}{req.message}" if not injected else req.message,
+            })
+        else:
+            messages.append({"role": "user", "content": req.message})
 
         # Run the agent
         agent = _get_agent()
@@ -184,6 +184,17 @@ async def chat(req: ChatRequest):
             processing_ms=elapsed,
             guardrail_blocked=True,
             blocked_reason="safety",
+        )
+
+    except OutputGuardrailTripwireTriggered as e:
+        elapsed = int((time.time() - start) * 1000)
+        logger.warning(f"[chat] Output guardrail triggered (language) user={req.user_id}, returning response anyway")
+        raw = getattr(e, "result", None)
+        text = str(getattr(raw, "final_output", "")) if raw else ""
+        return ChatResponse(
+            response=text or "Beklager, det oppstod en feil. Prøv igjen.",
+            agent_name="Coach Majen",
+            processing_ms=elapsed,
         )
 
     except Exception as e:
